@@ -10,10 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
 
-# --- Mirror all stdout (including Ultralytics' own training logs) to a file.
-# Colab's live cell output isn't reliable for background-thread prints once
-# the launching cell shows as "finished" — this file is the reliable source
-# of truth for progress, checkable from any new cell at any time. ---
 LOG_FILE_PATH = "/content/worker.log"
 
 class _Tee:
@@ -27,9 +23,6 @@ class _Tee:
         for s in self.streams:
             s.flush()
     def isatty(self):
-        # uvicorn's log formatter checks this during setup to decide on
-        # colored output — delegate to the real terminal stream (the first
-        # one, which is the original sys.stdout/stderr we wrapped).
         return self.streams[0].isatty() if hasattr(self.streams[0], "isatty") else False
     def fileno(self):
         return self.streams[0].fileno()
@@ -41,7 +34,7 @@ _log_file = open(LOG_FILE_PATH, "a", buffering=1)
 sys.stdout = _Tee(sys.stdout, _log_file)
 sys.stderr = _Tee(sys.stderr, _log_file)
 
-app = FastAPI(title="YOLOv8 Fine-Tuning Worker")
+app = FastAPI(title="YOLOvX Training Worker")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +47,6 @@ app.add_middleware(
 SUPABASE_URL = "https://base.wiserly.org"
 LAST_RUN_PATH = "/content/last_run.json"
 
-# Stock architectures Ultralytics can auto-download when starting a brand new model.
 ALLOWED_BASE_ARCHITECTURES = {
     "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
     "yolov9t", "yolov9s", "yolov9m", "yolov9c", "yolov9e",
@@ -64,24 +56,15 @@ ALLOWED_BASE_ARCHITECTURES = {
 
 class FineTuneRequest(BaseModel):
     session_token: str
-    model_id: str          # model_name in private_model table (finetune) OR the new model's name (new)
-    project_id: str        # which project's annotated dataset to train on
-    version_tag: Optional[str] = None  # frozen DatasetVersioning tag, e.g. "v1" — omit/"v0" for live staging
+    model_id: str
+    project_id: str
+    version_tag: Optional[str] = None
     epochs: int = 30
-
-    # --- Mode: "finetune" uses the user's own private model as the base
-    # (decrypted via finetune-fetch-model). "new" starts from a stock
-    # pretrained Ultralytics architecture instead — no decrypt step needed,
-    # Ultralytics auto-downloads the .pt on first use. ---
-    mode: str = "finetune"                        # "finetune" | "new"
-    base_architecture: Optional[str] = None        # e.g. "yolov8n" — required when mode="new"
-
-    # --- Real hyperparameters, all optional. Omit any of these from the
-    # request and Ultralytics' own default is used — nothing is silently
-    # forced except epochs/imgsz/batch/optimizer as before. ---
+    mode: str = "finetune"
+    base_architecture: Optional[str] = None
     imgsz: int = 640
     batch: int = 16
-    optimizer: str = "auto"          # auto, SGD, Adam, AdamW, etc.
+    optimizer: str = "auto"
     lr0: Optional[float] = None
     lrf: Optional[float] = None
     momentum: Optional[float] = None
@@ -114,21 +97,17 @@ class UploadRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "worker": "YOLO Fine-Tuner"}
+    return {"status": "ok", "worker": "YOLOvX Training Worker"}
 
 
 def update_status(session_token: str, status: str, error_message: str = None, **extra):
-    """Best-effort status ping — never let a status-update failure kill training.
-    extra can carry project_id/model_id/mode/base_architecture/parent_model/
-    epochs/hyperparameters/metrics, which finetune-update-status persists
-    into the training_runs history table."""
     try:
         payload = {"session_token": session_token, "status": status, **extra}
         if error_message:
             payload["error_message"] = error_message[:500]
         requests.post(f"{SUPABASE_URL}/functions/v1/finetune-update-status", json=payload, timeout=10)
     except Exception as e:
-        print(f"⚠️ Failed to update status: {e}")
+        print(f"Failed to update status: {e}")
 
 
 def fetch_user_base_model(session_token: str, model_name: str) -> str:
@@ -152,8 +131,6 @@ def fetch_user_base_model(session_token: str, model_name: str) -> str:
 
 
 def resolve_base_weights(req: "FineTuneRequest", model_id: str) -> str:
-    """Returns a local path (or a stock architecture name Ultralytics will
-    auto-download) to use as the starting weights for training."""
     if req.mode == "new":
         arch = (req.base_architecture or "").strip().lower()
         if arch not in ALLOWED_BASE_ARCHITECTURES:
@@ -161,14 +138,9 @@ def resolve_base_weights(req: "FineTuneRequest", model_id: str) -> str:
                 f"Invalid or missing base_architecture '{arch}' for mode='new'. "
                 f"Must be one of: {sorted(ALLOWED_BASE_ARCHITECTURES)}"
             )
-        print(f"🆕 Starting a NEW model '{model_id}' from stock architecture '{arch}'...")
-        # Ultralytics auto-downloads this from its own release CDN on first use —
-        # no decrypt/fetch step needed since there's no existing private model.
         return f"{arch}.pt"
     else:
-        print(f"🔐 Fetching and decrypting base model '{model_id}' for fine-tuning...")
         path = fetch_user_base_model(req.session_token, model_id)
-        print(f"✅ Base model ready at {path}")
         return path
 
 
@@ -206,11 +178,8 @@ def fetch_dataset(session_token: str, project_id: str, version_tag: Optional[str
 
 
 def run_finetune_job(req: "FineTuneRequest", model_id: str):
-    """Trains and saves results locally. Does NOT upload — that's a separate,
-    explicit step (Cell 3) so you can review metrics before committing the
-    new weights over the old model."""
     base_weights_path = None
-    is_downloaded_base = False  # only delete it after if WE fetched+decrypted it
+    is_downloaded_base = False
     update_status(
         req.session_token, "training",
         project_id=req.project_id, model_id=model_id, mode=req.mode,
@@ -220,14 +189,10 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
     )
     try:
         base_weights_path = resolve_base_weights(req, model_id)
-        is_downloaded_base = req.mode != "new"  # stock .pt files are cached by ultralytics, not ours to delete
+        is_downloaded_base = req.mode != "new"
 
-        print(f"📦 Exporting dataset for project '{req.project_id}'...")
         data_yaml_path = fetch_dataset(req.session_token, req.project_id, req.version_tag)
-        print(f"✅ Dataset ready at {data_yaml_path}")
 
-        # Build train() kwargs — only include hyperparams that were actually set,
-        # so anything left as None falls through to Ultralytics' own default.
         train_kwargs = {
             "data": data_yaml_path,
             "epochs": req.epochs,
@@ -247,7 +212,6 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
             if val is not None:
                 train_kwargs[field] = val
 
-        print(f"🚀 Training with: {train_kwargs}")
         model = YOLO(base_weights_path)
         results = model.train(**train_kwargs)
 
@@ -255,7 +219,6 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         if not os.path.exists(weights_path):
             raise Exception("Weights file not found after training completed.")
 
-        # Pull final metrics for the review step
         metrics = {}
         try:
             rd = results.results_dict
@@ -268,7 +231,6 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         except Exception:
             pass
 
-        # Write everything Cell 3 needs to upload, without re-running anything
         with open(LAST_RUN_PATH, "w") as f:
             json.dump({
                 "session_token": req.session_token,
@@ -280,18 +242,12 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
                 "train_kwargs": {k: v for k, v in train_kwargs.items() if k != "data"},
             }, f)
 
-        print("✅ Training complete. Results saved for review.")
-        print(f"📊 Metrics: {metrics}")
-        print("👉 Happy with these results? Run Cell 3 to upload the new weights.")
-        print("   Not happy? Just re-run Cell 2 with different settings — nothing was uploaded.")
-
         update_status(
             req.session_token, "review",
             hyperparameters={k: v for k, v in train_kwargs.items() if k != "data"},
             metrics=metrics,
         )
     except Exception as e:
-        print(f"❌ Error during training execution: {str(e)}")
         update_status(req.session_token, "failed", str(e))
     finally:
         if is_downloaded_base and base_weights_path and os.path.exists(base_weights_path):
@@ -300,8 +256,6 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
 
 @app.post("/start-finetune")
 def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
-    # Always verify the token, regardless of mode — this is what proves the
-    # request is legitimately authenticated, not the model's existence.
     verify_res = requests.post(
         f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
         json={"session_token": req.session_token}
@@ -311,136 +265,75 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
     session_data = verify_res.json()
 
     if req.mode == "new":
-        model_id = req.model_id  # new model name — nothing to look up yet
-        print(f"🚀 Token verified! Starting NEW model training: '{model_id}' from '{req.base_architecture}'...")
+        model_id = req.model_id
     else:
         model_id = session_data.get("model_id", req.model_id)
-        print(f"🚀 Token verified! Starting YOLOv8 fine-tuning for model: {model_id}...")
 
     background_tasks.add_task(run_finetune_job, req, model_id)
 
     return {
         "status": "started",
-        "message": "Training dispatched. Check Colab logs for progress and review results before uploading.",
+        "message": "Training dispatched.",
         "model_id": model_id,
         "mode": req.mode,
     }
 
+
 @app.post("/upload-weights")
 def upload_weights(req: UploadRequest):
     if not req.session_token:
-        raise HTTPException(
-            status_code=400,
-            detail="session_token is required",
-        )
+        raise HTTPException(status_code=400, detail="session_token is required")
 
     if not os.path.exists(LAST_RUN_PATH):
-        raise HTTPException(
-            status_code=404,
-            detail="No completed training run is available for upload.",
-        )
+        raise HTTPException(status_code=404, detail="No completed training run available.")
 
     try:
         with open(LAST_RUN_PATH, "r") as f:
             run_data = json.load(f)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not read training run metadata: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Could not read metadata: {e}")
 
     staged_token = run_data.get("session_token")
-
-    if not staged_token:
-        raise HTTPException(
-            status_code=500,
-            detail="Training run does not contain a session token.",
-        )
-
-    if staged_token != req.session_token:
-        raise HTTPException(
-            status_code=403,
-            detail="Training session does not match the staged weights.",
-        )
+    if not staged_token or staged_token != req.session_token:
+        raise HTTPException(status_code=403, detail="Session does not match staged weights.")
 
     weights_path = run_data.get("weights_path")
-
-    if not weights_path:
-        raise HTTPException(
-            status_code=404,
-            detail="Training weights path is missing.",
-        )
-
-    if not os.path.exists(weights_path):
-        raise HTTPException(
-            status_code=404,
-            detail="Training weights file was not found.",
-        )
+    if not weights_path or not os.path.exists(weights_path):
+        raise HTTPException(status_code=404, detail="Training weights file not found.")
 
     model_id = run_data.get("model_id")
-
     if not model_id:
-        raise HTTPException(
-            status_code=500,
-            detail="Training run does not contain a model_id.",
-        )
+        raise HTTPException(status_code=500, detail="Training run missing model_id.")
 
     try:
         with open(weights_path, "rb") as weights_file:
             response = requests.post(
                 f"{SUPABASE_URL}/functions/v1/complete-finetune-session",
-                headers={
-                    "Authorization": f"Bearer {req.session_token}",
-                },
-                files={
-                    "file": (
-                        "best.pt",
-                        weights_file,
-                        "application/octet-stream",
-                    ),
-                },
-                data={
-                    "model_id": model_id,
-                },
+                headers={"Authorization": f"Bearer {req.session_token}"},
+                files={"file": ("best.pt", weights_file, "application/octet-stream")},
+                data={"model_id": model_id},
                 timeout=120,
             )
-    except requests.RequestException as e:
-        print(f"Failed to upload weights to Supabase: {e}")
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to the weight upload service.",
-        )
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Could not connect to upload service.")
 
     if response.status_code != 200:
-        print(
-            "Weight upload service returned "
-            f"{response.status_code}: {response.text}"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail="Weight upload failed.",
-        )
+        raise HTTPException(status_code=502, detail="Weight upload failed.")
 
     try:
         upload_result = response.json()
     except Exception:
-        upload_result = {
-            "success": True,
-        }
+        upload_result = {"success": True}
 
     try:
-        update_status(
-            req.session_token,
-            "completed",
-        )
-    except Exception as e:
-        print(f"Failed to update worker session status: {e}")
+        update_status(req.session_token, "completed")
+    except Exception:
+        pass
 
     try:
         os.remove(LAST_RUN_PATH)
-    except Exception as e:
-        print(f"Failed to remove staged run metadata: {e}")
+    except Exception:
+        pass
 
     return {
         "success": True,
