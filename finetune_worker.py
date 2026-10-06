@@ -231,6 +231,23 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         except Exception:
             pass
 
+        # Class count of the dataset just trained on (used when saving to private models).
+        # Kept outside the try above so a results_dict failure can't drop it.
+        num_classes = 0
+        try:
+            names = getattr(results, "names", None) or getattr(model, "names", None) or {}
+            num_classes = len(names)
+        except Exception:
+            pass
+        if num_classes:
+            metrics["num_classes"] = num_classes
+        print(f"[worker] num_classes={num_classes}", flush=True)
+
+        run_hyperparameters = {k: v for k, v in train_kwargs.items() if k != "data"}
+        if num_classes:
+            # duplicate in hyperparameters in case the status function filters metric keys
+            run_hyperparameters["nc"] = num_classes
+
         with open(LAST_RUN_PATH, "w") as f:
             json.dump({
                 "session_token": req.session_token,
@@ -244,7 +261,7 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
 
         update_status(
             req.session_token, "review",
-            hyperparameters={k: v for k, v in train_kwargs.items() if k != "data"},
+            hyperparameters=run_hyperparameters,
             metrics=metrics,
         )
     except Exception as e:
